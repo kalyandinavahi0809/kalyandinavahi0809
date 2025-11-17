@@ -1,0 +1,433 @@
+name: Deploy to Production
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+      version:
+        description: 'Model version to deploy'
+        required: true
+        type: string
+      skip_tests:
+        description: 'Skip validation tests (not recommended)'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  PYTHON_VERSION: '3.9'
+  SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+  SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+  SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+
+jobs:
+  pre-deployment-checks:
+    name: Pre-Deployment Checks
+    runs-on: ubuntu-latest
+    outputs:
+      proceed: ${{ steps.decision.outputs.proceed }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      
+      - name: Run pre-deployment checklist
+        id: checklist
+        run: |
+          python scripts/pre_deployment_check.py \
+            --version ${{ github.event.inputs.version }} \
+            --environment ${{ github.event.inputs.environment }} \
+            --output-json checklist_results.json
+      
+      - name: Verify model exists
+        run: |
+          python scripts/verify_model_exists.py \
+            --version ${{ github.event.inputs.version }}
+      
+      - name: Check system health
+        run: |
+          python scripts/check_system_health.py \
+            --environment ${{ github.event.inputs.environment }}
+      
+      - name: Make deployment decision
+        id: decision
+        run: |
+          PROCEED=$(jq -r '.all_checks_passed' checklist_results.json)
+          echo "proceed=$PROCEED" >> $GITHUB_OUTPUT
+          
+          if [ "$PROCEED" = "false" ]; then
+            echo "⚠️ Pre-deployment checks failed. Review checklist_results.json"
+            cat checklist_results.json
+          fi
+      
+      - name: Upload checklist results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: pre-deployment-checklist
+          path: checklist_results.json
+
+  backup:
+    name: Backup Current State
+    runs-on: ubuntu-latest
+    needs: pre-deployment-checks
+    if: needs.pre-deployment-checks.outputs.proceed == 'true'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      
+      - name: Backup production model
+        run: |
+          python scripts/backup_production.py \
+            --environment ${{ github.event.inputs.environment }} \
+            --backup-location s3://ml-backups/$(date +%Y%m%d_%H%M%S)
+      
+      - name: Backup database state
+        run: |
+          python scripts/backup_database.py \
+            --environment ${{ github.event.inputs.environment }}
+
+  deploy-feature-store:
+    name: Deploy Feature Store
+    runs-on: ubuntu-latest
+    needs: backup
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      
+      - name: Deploy feature store
+        run: |
+          python feature_store/setup_feature_store.py \
+            --env ${{ github.event.inputs.environment }} \
+            --validate
+      
+      - name: Verify feature store
+        run: |
+          python scripts/verify_feature_store.py \
+            --environment ${{ github.event.inputs.environment }}
+
+  deploy-sql:
+    name: Deploy SQL Objects
+    runs-on: ubuntu-latest
+    needs: deploy-feature-store
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Install SnowSQL
+        run: |
+          curl -O https://sfc-repo.snowflakecomputing.com/snowsql/bootstrap/1.2/linux_x86_64/snowsql-1.2.28-linux_x86_64.bash
+          bash snowsql-1.2.28-linux_x86_64.bash
+      
+      - name: Deploy views
+        run: |
+          snowsql -c ${{ github.event.inputs.environment }} \
+            -f sql/view_definitions.sql
+      
+      - name: Deploy inference function
+        run: |
+          snowsql -c ${{ github.event.inputs.environment }} \
+            -f sql/inference_table_function.sql
+      
+      - name: Setup grants
+        run: |
+          snowsql -c ${{ github.event.inputs.environment }} \
+            -f deployment/grants_setup.sql
+      
+      - name: Verify SQL objects
+        run: |
+          snowsql -c ${{ github.event.inputs.environment }} \
+            -q "SHOW VIEWS; SHOW FUNCTIONS;"
+
+  deploy-model:
+    name: Deploy Model
+    runs-on: ubuntu-latest
+    needs: deploy-sql
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      
+      - name: Get model from registry
+        run: |
+          python modeling/registry.py \
+            --action get \
+            --model-name signal_imputation_v2 \
+            --version ${{ github.event.inputs.version }} \
+            --output-path models/deploy
+      
+      - name: Deploy model
+        run: |
+          python scripts/deploy_model.py \
+            --version ${{ github.event.inputs.version }} \
+            --environment ${{ github.event.inputs.environment }} \
+            --model-path models/deploy
+      
+      - name: Promote model
+        run: |
+          python modeling/registry.py \
+            --action promote \
+            --model-name signal_imputation_v2 \
+            --version ${{ github.event.inputs.version }} \
+            --stage ${{ github.event.inputs.environment }}
+
+  deploy-monitoring:
+    name: Deploy Monitoring
+    runs-on: ubuntu-latest
+    needs: deploy-model
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      
+      - name: Deploy quality checks
+        run: |
+          python monitoring/quality_checks.py \
+            --setup \
+            --environment ${{ github.event.inputs.environment }}
+      
+      - name: Deploy drift detection
+        run: |
+          python monitoring/drift_detection.py \
+            --setup \
+            --environment ${{ github.event.inputs.environment }}
+      
+      - name: Configure alerts
+        run: |
+          python monitoring/alert_rules.py \
+            --deploy \
+            --environment ${{ github.event.inputs.environment }}
+
+  validation:
+    name: Post-Deployment Validation
+    runs-on: ubuntu-latest
+    needs: [deploy-model, deploy-monitoring]
+    if: github.event.inputs.skip_tests == 'false'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Install dependencies
+        run: pip install -r requirements.txt pytest
+      
+      - name: Run smoke tests
+        run: |
+          python scripts/smoke_tests.py \
+            --environment ${{ github.event.inputs.environment }} \
+            --timeout 300
+      
+      - name: Test inference endpoint
+        run: |
+          python scripts/test_inference.py \
+            --environment ${{ github.event.inputs.environment }} \
+            --sample-size 100
+      
+      - name: Check metrics
+        id: metrics
+        run: |
+          python scripts/check_metrics.py \
+            --environment ${{ github.event.inputs.environment }} \
+            --duration 300 \
+            --output-json metrics.json
+          
+          HEALTH=$(jq -r '.health' metrics.json)
+          echo "health=$HEALTH" >> $GITHUB_OUTPUT
+      
+      - name: Rollback if unhealthy
+        if: steps.metrics.outputs.health == 'unhealthy'
+        run: |
+          echo "⚠️ Deployment validation failed. Initiating rollback..."
+          python scripts/rollback.py \
+            --environment ${{ github.event.inputs.environment }} \
+            --reason "Validation failed"
+          exit 1
+      
+      - name: Upload validation results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: validation-results
+          path: |
+            metrics.json
+            smoke_test_results.txt
+
+  monitor-deployment:
+    name: Monitor Deployment
+    runs-on: ubuntu-latest
+    needs: validation
+    if: success()
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      
+      - name: Monitor for 1 hour
+        run: |
+          python scripts/monitor_deployment.py \
+            --environment ${{ github.event.inputs.environment }} \
+            --duration 3600 \
+            --alert-on-error \
+            --output-json monitoring_results.json
+      
+      - name: Generate deployment report
+        run: |
+          python scripts/generate_deployment_report.py \
+            --version ${{ github.event.inputs.version }} \
+            --environment ${{ github.event.inputs.environment }} \
+            --monitoring-results monitoring_results.json \
+            --output deployment_report.md
+      
+      - name: Upload monitoring results
+        uses: actions/upload-artifact@v3
+        with:
+          name: monitoring-results
+          path: |
+            monitoring_results.json
+            deployment_report.md
+
+  notify:
+    name: Notify Team
+    runs-on: ubuntu-latest
+    needs: [deploy-model, validation, monitor-deployment]
+    if: always()
+    
+    steps:
+      - name: Determine status
+        id: status
+        run: |
+          if [ "${{ needs.deploy-model.result }}" = "success" ] && \
+             [ "${{ needs.validation.result }}" = "success" ]; then
+            echo "status=success" >> $GITHUB_OUTPUT
+            echo "emoji=✅" >> $GITHUB_OUTPUT
+          else
+            echo "status=failure" >> $GITHUB_OUTPUT
+            echo "emoji=❌" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Send Slack notification
+        uses: slackapi/slack-github-action@v1
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          payload: |
+            {
+              "text": "${{ steps.status.outputs.emoji }} Deployment to ${{ github.event.inputs.environment }}",
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "${{ steps.status.outputs.emoji }} Deployment Complete"
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Environment:* ${{ github.event.inputs.environment }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Version:* ${{ github.event.inputs.version }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Status:* ${{ steps.status.outputs.status }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Triggered by:* ${{ github.actor }}"
+                    }
+                  ]
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "View details: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                  }
+                }
+              ]
+            }
+      
+      - name: Send email notification
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          username: ${{ secrets.EMAIL_USERNAME }}
+          password: ${{ secrets.EMAIL_PASSWORD }}
+          subject: "${{ steps.status.outputs.emoji }} Deployment to ${{ github.event.inputs.environment }}"
+          body: |
+            Deployment Status: ${{ steps.status.outputs.status }}
+            Environment: ${{ github.event.inputs.environment }}
+            Version: ${{ github.event.inputs.version }}
+            Triggered by: ${{ github.actor }}
+            
+            View details: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          to: ml-team@company.com
+          from: GitHub Actions

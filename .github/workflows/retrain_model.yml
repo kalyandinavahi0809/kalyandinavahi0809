@@ -1,0 +1,314 @@
+name: Retrain Model
+
+on:
+  schedule:
+    # Run weekly on Mondays at 2 AM UTC
+    - cron: '0 2 * * 1'
+  workflow_dispatch:
+    inputs:
+      model_type:
+        description: 'Model type to train'
+        required: true
+        default: 'xgboost'
+        type: choice
+        options:
+          - xgboost
+          - random_forest
+          - ensemble
+      force_retrain:
+        description: 'Force retrain even if performance is good'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  PYTHON_VERSION: '3.9'
+  SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+  SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+  SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+  SNOWFLAKE_WAREHOUSE: 'TRAINING_WH'
+  SNOWFLAKE_DATABASE: 'ML_DATABASE'
+  SNOWFLAKE_SCHEMA: 'ML_SCHEMA'
+
+jobs:
+  check-performance:
+    name: Check Current Model Performance
+    runs-on: ubuntu-latest
+    outputs:
+      needs_retraining: ${{ steps.evaluate.outputs.needs_retraining }}
+      current_rmse: ${{ steps.evaluate.outputs.current_rmse }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      - name: Check current model performance
+        id: evaluate
+        run: |
+          python scripts/check_model_performance.py \
+            --output-json performance.json
+          
+          # Parse results
+          RMSE=$(jq -r '.rmse' performance.json)
+          NEEDS_RETRAINING=$(jq -r '.needs_retraining' performance.json)
+          
+          echo "current_rmse=$RMSE" >> $GITHUB_OUTPUT
+          echo "needs_retraining=$NEEDS_RETRAINING" >> $GITHUB_OUTPUT
+          
+          echo "Current RMSE: $RMSE"
+          echo "Needs retraining: $NEEDS_RETRAINING"
+
+  train-model:
+    name: Train New Model
+    runs-on: ubuntu-latest
+    needs: check-performance
+    if: needs.check-performance.outputs.needs_retraining == 'true' || github.event.inputs.force_retrain == 'true'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      - name: Generate training data
+        run: |
+          python data/generate_synthetic_data.py \
+            --num-samples 100000 \
+            --output data/training_data.csv
+      
+      - name: Run training pipeline
+        run: |
+          python modeling/pipeline.py \
+            --mode train \
+            --model-type ${{ github.event.inputs.model_type || 'xgboost' }} \
+            --output-dir models/new_model \
+            --metrics-file metrics.json
+      
+      - name: Run hyperparameter tuning
+        run: |
+          python modeling/hyperparameter_tuning.py \
+            --model-type ${{ github.event.inputs.model_type || 'xgboost' }} \
+            --n-trials 50 \
+            --output tuned_params.json
+      
+      - name: Evaluate model
+        id: evaluate
+        run: |
+          python scripts/evaluate_model.py \
+            --model-path models/new_model \
+            --test-data data/test_data.csv \
+            --output-json evaluation.json
+          
+          # Parse metrics
+          RMSE=$(jq -r '.rmse' evaluation.json)
+          MAE=$(jq -r '.mae' evaluation.json)
+          R2=$(jq -r '.r2' evaluation.json)
+          
+          echo "rmse=$RMSE" >> $GITHUB_OUTPUT
+          echo "mae=$MAE" >> $GITHUB_OUTPUT
+          echo "r2=$R2" >> $GITHUB_OUTPUT
+          
+          echo "Model Metrics:"
+          echo "  RMSE: $RMSE"
+          echo "  MAE: $MAE"
+          echo "  R2: $R2"
+      
+      - name: Check if model improved
+        id: check_improvement
+        run: |
+          CURRENT_RMSE="${{ needs.check-performance.outputs.current_rmse }}"
+          NEW_RMSE="${{ steps.evaluate.outputs.rmse }}"
+          
+          python -c "
+          import sys
+          current = float('$CURRENT_RMSE')
+          new = float('$NEW_RMSE')
+          improved = new < current
+          improvement_pct = ((current - new) / current) * 100 if current > 0 else 0
+          
+          print(f'Current RMSE: {current:.4f}')
+          print(f'New RMSE: {new:.4f}')
+          print(f'Improvement: {improvement_pct:.2f}%')
+          
+          if improved:
+              print('Model improved! Proceeding with registration.')
+              with open('$GITHUB_OUTPUT', 'a') as f:
+                  f.write('improved=true\n')
+          else:
+              print('Model did not improve. Skipping registration.')
+              with open('$GITHUB_OUTPUT', 'a') as f:
+                  f.write('improved=false\n')
+          "
+      
+      - name: Upload model artifacts
+        if: steps.check_improvement.outputs.improved == 'true'
+        uses: actions/upload-artifact@v3
+        with:
+          name: trained-model
+          path: |
+            models/new_model/
+            metrics.json
+            evaluation.json
+          retention-days: 30
+
+  register-model:
+    name: Register Model in Registry
+    runs-on: ubuntu-latest
+    needs: train-model
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      
+      - name: Download model artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: trained-model
+          path: models/new_model
+      
+      - name: Register model
+        id: register
+        run: |
+          VERSION=$(python modeling/registry.py \
+            --action register \
+            --model-name signal_imputation_v2 \
+            --model-path models/new_model \
+            --metrics-file metrics.json \
+            --metadata-file evaluation.json)
+          
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Registered model version: $VERSION"
+      
+      - name: Promote to staging
+        run: |
+          python modeling/registry.py \
+            --action promote \
+            --model-name signal_imputation_v2 \
+            --version ${{ steps.register.outputs.version }} \
+            --stage staging
+          
+          echo "Model promoted to staging"
+
+  validate-staging:
+    name: Validate in Staging
+    runs-on: ubuntu-latest
+    needs: register-model
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      
+      - name: Run staging tests
+        run: |
+          pytest tests/ -m integration \
+            --env staging \
+            -v \
+            --junitxml=staging_results.xml
+      
+      - name: Upload test results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: staging-test-results
+          path: staging_results.xml
+
+  notify:
+    name: Notify Team
+    runs-on: ubuntu-latest
+    needs: [train-model, register-model, validate-staging]
+    if: always()
+    
+    steps:
+      - name: Send Slack notification
+        uses: slackapi/slack-github-action@v1
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          payload: |
+            {
+              "text": "Model Retraining Complete",
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "🤖 Model Retraining Complete"
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Status:* ${{ job.status }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Model Type:* ${{ github.event.inputs.model_type || 'xgboost' }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*RMSE:* ${{ needs.train-model.outputs.rmse }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*MAE:* ${{ needs.train-model.outputs.mae }}"
+                    }
+                  ]
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "View details: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                  }
+                }
+              ]
+            }
+      
+      - name: Create issue on failure
+        if: failure()
+        uses: actions/github-script@v6
+        with:
+          script: |
+            github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: '❌ Model Retraining Failed',
+              body: `Model retraining workflow failed.\n\nWorkflow: ${context.workflow}\nRun: ${context.runId}\nSee: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              labels: ['ml-pipeline', 'bug', 'priority-high']
+            })

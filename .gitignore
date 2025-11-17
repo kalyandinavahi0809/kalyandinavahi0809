@@ -1,0 +1,178 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environments
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+.venv/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+*.ipynb
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+.hypothesis/
+junit.xml
+test-results/
+
+# MyPy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pytype
+.pytype/
+
+# Pyre
+.pyre/
+
+# Model artifacts
+models/
+*.pkl
+*.joblib
+*.h5
+*.pb
+*.onnx
+*.pt
+*.pth
+
+# Data files
+data/*.csv
+data/*.parquet
+data/*.json
+data/*.txt
+!data/README.md
+
+# Logs
+logs/
+*.log
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Secrets
+secrets/
+*.pem
+*.key
+credentials.json
+service-account.json
+
+# Snowflake
+snowsql_config
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Backup files
+*.bak
+*.backup
+*~
+
+# Documentation builds
+docs/_build/
+site/
+
+# MLflow
+mlruns/
+mlartifacts/
+
+# Airflow
+airflow.cfg
+airflow.db
+airflow-webserver.pid
+logs/
+
+# DVC
+.dvc/
+*.dvc
+
+# Profiling
+*.prof
+
+# Package files
+*.whl
+*.tar.gz
+
+# Config overrides
+config.local.yaml
+config.override.yaml
+
+# Security scan results
+bandit-report.json
+safety-report.json
+
+# Performance test results
+performance_results/
+
+# Database dumps
+*.sql.gz
+*.dump
+
+# Cache
+.cache/
+*.cache
+
+# Hydra
+outputs/
+multirun/
+
+# Weights & Biases
+wandb/
+
+# Experiment tracking
+experiments/
+checkpoints/
+
+# Large files (use Git LFS or exclude)
+*.zip
+*.tar
+*.gz
+*.7z
