@@ -1,0 +1,167 @@
+{
+  "dashboard": {
+    "title": "Network Signal Imputation Monitoring",
+    "refresh_interval_seconds": 300,
+    "time_range": "24h"
+  },
+  "panels": [
+    {
+      "id": "model_performance",
+      "title": "Model Performance Metrics",
+      "type": "timeseries",
+      "metrics": [
+        {
+          "name": "RMSE",
+          "query": "SELECT timestamp, rmse FROM model_metrics",
+          "color": "#FF6B6B",
+          "threshold": 0.2
+        },
+        {
+          "name": "MAE",
+          "query": "SELECT timestamp, mae FROM model_metrics",
+          "color": "#4ECDC4",
+          "threshold": 0.15
+        },
+        {
+          "name": "R2 Score",
+          "query": "SELECT timestamp, r2_score FROM model_metrics",
+          "color": "#45B7D1",
+          "threshold": 0.85
+        }
+      ]
+    },
+    {
+      "id": "data_quality",
+      "title": "Data Quality Indicators",
+      "type": "gauge",
+      "metrics": [
+        {
+          "name": "Missing Data %",
+          "query": "SELECT missing_percentage FROM data_quality_metrics WHERE metric = 'missing_data'",
+          "ranges": [
+            {"min": 0, "max": 10, "color": "green"},
+            {"min": 10, "max": 30, "color": "yellow"},
+            {"min": 30, "max": 100, "color": "red"}
+          ]
+        },
+        {
+          "name": "Data Freshness (hours)",
+          "query": "SELECT hours_since_last_update FROM data_quality_metrics WHERE metric = 'freshness'",
+          "ranges": [
+            {"min": 0, "max": 1, "color": "green"},
+            {"min": 1, "max": 6, "color": "yellow"},
+            {"min": 6, "max": 24, "color": "red"}
+          ]
+        }
+      ]
+    },
+    {
+      "id": "drift_detection",
+      "title": "Drift Detection Alerts",
+      "type": "table",
+      "query": "SELECT timestamp, drift_type, feature, psi_value, status FROM drift_alerts ORDER BY timestamp DESC LIMIT 10",
+      "columns": [
+        {"field": "timestamp", "header": "Time"},
+        {"field": "drift_type", "header": "Type"},
+        {"field": "feature", "header": "Feature"},
+        {"field": "psi_value", "header": "PSI"},
+        {"field": "status", "header": "Status"}
+      ]
+    },
+    {
+      "id": "prediction_volume",
+      "title": "Prediction Volume",
+      "type": "bar",
+      "query": "SELECT DATE_TRUNC('hour', timestamp) as hour, COUNT(*) as count FROM predictions WHERE timestamp >= DATEADD(day, -1, CURRENT_TIMESTAMP()) GROUP BY hour ORDER BY hour",
+      "x_axis": "hour",
+      "y_axis": "count"
+    },
+    {
+      "id": "feature_distribution",
+      "title": "Feature Distributions",
+      "type": "histogram",
+      "features": [
+        "signal_strength",
+        "signal_quality",
+        "bandwidth_usage"
+      ],
+      "bins": 30
+    },
+    {
+      "id": "error_distribution",
+      "title": "Prediction Error Distribution",
+      "type": "histogram",
+      "query": "SELECT (predicted_value - actual_value) as error FROM predictions WHERE actual_value IS NOT NULL",
+      "bins": 50,
+      "color": "#FF6B6B"
+    },
+    {
+      "id": "model_versions",
+      "title": "Active Model Versions",
+      "type": "pie",
+      "query": "SELECT model_version, COUNT(*) as count FROM predictions WHERE timestamp >= DATEADD(hour, -24, CURRENT_TIMESTAMP()) GROUP BY model_version",
+      "label_field": "model_version",
+      "value_field": "count"
+    },
+    {
+      "id": "inference_latency",
+      "title": "Inference Latency (ms)",
+      "type": "timeseries",
+      "query": "SELECT timestamp, AVG(inference_time_ms) as avg_latency, PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY inference_time_ms) as p95_latency FROM inference_logs GROUP BY timestamp",
+      "metrics": [
+        {"name": "Average", "field": "avg_latency", "color": "#4ECDC4"},
+        {"name": "P95", "field": "p95_latency", "color": "#FF6B6B"}
+      ]
+    }
+  ],
+  "alerts": {
+    "enabled": true,
+    "channels": [
+      {
+        "type": "email",
+        "recipients": ["ml-team@company.com"]
+      },
+      {
+        "type": "slack",
+        "webhook_url": "${SLACK_WEBHOOK_URL}"
+      }
+    ],
+    "rules": [
+      {
+        "name": "High RMSE",
+        "condition": "rmse > 0.2",
+        "severity": "warning",
+        "message": "Model RMSE exceeded threshold"
+      },
+      {
+        "name": "Data Drift Detected",
+        "condition": "psi > 0.1",
+        "severity": "critical",
+        "message": "Significant data drift detected in features"
+      },
+      {
+        "name": "Stale Data",
+        "condition": "hours_since_last_update > 6",
+        "severity": "warning",
+        "message": "Data has not been updated recently"
+      },
+      {
+        "name": "High Missing Data",
+        "condition": "missing_percentage > 30",
+        "severity": "critical",
+        "message": "Excessive missing data detected"
+      }
+    ]
+  },
+  "data_sources": {
+    "primary": {
+      "type": "snowflake",
+      "connection": {
+        "account": "${SNOWFLAKE_ACCOUNT}",
+        "warehouse": "ANALYTICS_WH",
+        "database": "ML_DATABASE",
+        "schema": "MONITORING"
+      }
+    }
+  }
+}

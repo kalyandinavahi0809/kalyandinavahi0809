@@ -1,0 +1,316 @@
+# Network Signal Imputation ML Pipeline Configuration
+
+# Project metadata
+project:
+  name: "network-signal-imputation"
+  version: "1.0.0"
+  description: "Production-ready ML pipeline for network signal imputation"
+  author: "ML Team"
+
+# Snowflake configuration
+snowflake:
+  account: "${SNOWFLAKE_ACCOUNT}"
+  user: "${SNOWFLAKE_USER}"
+  password: "${SNOWFLAKE_PASSWORD}"
+  warehouse: "COMPUTE_WH"
+  database: "ML_DATABASE"
+  schema: "ML_SCHEMA"
+  role: "ML_DEVELOPER_ROLE"
+  
+  # Warehouses for different purposes
+  warehouses:
+    training: "TRAINING_WH"
+    inference: "INFERENCE_WH"
+    analytics: "ANALYTICS_WH"
+
+# Feature Store configuration
+feature_store:
+  enabled: true
+  schema: "FEATURE_STORE"
+  materialization:
+    enabled: true
+    schedule: "0 */1 * * *"  # Every hour
+  
+  # Feature groups
+  feature_groups:
+    - name: "signal_features"
+      features:
+        - signal_strength
+        - signal_quality
+        - bandwidth_usage
+        - network_type
+    
+    - name: "temporal_features"
+      features:
+        - hour_of_day
+        - day_of_week
+        - is_weekend
+    
+    - name: "aggregated_features"
+      features:
+        - avg_signal_1h
+        - stddev_signal_1h
+        - min_signal_1h
+        - max_signal_1h
+
+# Model configuration
+model:
+  name: "signal_imputation_v2"
+  type: "xgboost"
+  
+  # Hyperparameters
+  hyperparameters:
+    learning_rate: 0.1
+    max_depth: 6
+    n_estimators: 100
+    subsample: 0.8
+    colsample_bytree: 0.8
+    random_state: 42
+  
+  # Training configuration
+  training:
+    test_size: 0.2
+    validation_size: 0.1
+    random_state: 42
+    stratify: false
+    
+    # Data selection
+    data_window_days: 90
+    min_samples: 10000
+  
+  # Evaluation metrics
+  metrics:
+    primary: "rmse"
+    secondary:
+      - "mae"
+      - "r2"
+      - "mape"
+  
+  # Performance thresholds
+  thresholds:
+    rmse_max: 0.20
+    mae_max: 0.15
+    r2_min: 0.85
+
+# Model Registry configuration
+model_registry:
+  uri: "snowflake://models"
+  artifact_location: "s3://ml-models/signal-imputation/"
+  
+  # Lifecycle stages
+  stages:
+    - development
+    - staging
+    - production
+    - archived
+  
+  # Retention policy
+  retention:
+    development_days: 30
+    staging_days: 90
+    production_days: 365
+    archived_days: 730
+
+# Monitoring configuration
+monitoring:
+  enabled: true
+  
+  # Data quality thresholds
+  data_quality:
+    max_missing_percentage: 30
+    max_duplicates: 0
+    max_data_age_hours: 24
+    value_ranges:
+      signal_strength: [-120, 0]
+      signal_quality: [0, 100]
+      bandwidth_usage: [0, 100]
+  
+  # Drift detection
+  drift:
+    enabled: true
+    psi_threshold: 0.1
+    check_frequency_hours: 24
+    reference_window_days: 30
+  
+  # Performance monitoring
+  performance:
+    check_frequency_minutes: 15
+    alert_threshold_rmse: 0.25
+    alert_threshold_latency_ms: 500
+    alert_threshold_error_rate: 0.05
+  
+  # Alerting
+  alerts:
+    enabled: true
+    channels:
+      - type: "slack"
+        webhook_url: "${SLACK_WEBHOOK_URL}"
+      - type: "email"
+        recipients:
+          - "ml-team@company.com"
+      - type: "pagerduty"
+        service_key: "${PAGERDUTY_SERVICE_KEY}"
+    
+    # Alert rules
+    rules:
+      - name: "high_rmse"
+        condition: "rmse > 0.20"
+        severity: "warning"
+        cooldown_minutes: 60
+      
+      - name: "critical_rmse"
+        condition: "rmse > 0.30"
+        severity: "critical"
+        cooldown_minutes: 30
+      
+      - name: "feature_drift"
+        condition: "psi > 0.1"
+        severity: "critical"
+        cooldown_minutes: 120
+      
+      - name: "stale_data"
+        condition: "hours_since_update > 6"
+        severity: "warning"
+        cooldown_minutes: 180
+
+# Deployment configuration
+deployment:
+  strategy: "blue-green"
+  
+  # Health checks
+  health_checks:
+    enabled: true
+    timeout_seconds: 300
+    interval_seconds: 30
+    failure_threshold: 3
+  
+  # Rollback configuration
+  rollback:
+    enabled: true
+    auto_rollback: true
+    rollback_criteria:
+      error_rate_threshold: 0.05
+      performance_degradation_pct: 50
+      latency_threshold_ms: 1000
+  
+  # Traffic management
+  traffic:
+    gradual_rollout: true
+    stages: [0.1, 0.25, 0.5, 1.0]
+    stage_duration_minutes: 30
+
+# Inference configuration
+inference:
+  batch:
+    enabled: true
+    schedule: "0 * * * *"  # Every hour
+    batch_size: 10000
+    parallelism: 4
+  
+  real_time:
+    enabled: true
+    timeout_ms: 100
+    max_concurrent_requests: 1000
+    cache_ttl_seconds: 300
+
+# Logging configuration
+logging:
+  level: "INFO"
+  format: "json"
+  
+  # Log destinations
+  destinations:
+    - type: "console"
+      enabled: true
+    - type: "file"
+      enabled: true
+      path: "logs/pipeline.log"
+      rotation: "1 day"
+      retention: "30 days"
+    - type: "snowflake"
+      enabled: true
+      table: "LOGS.PIPELINE_LOGS"
+
+# Testing configuration
+testing:
+  unit:
+    coverage_threshold: 80
+  
+  integration:
+    enabled: true
+    environment: "staging"
+  
+  smoke:
+    sample_size: 100
+    timeout_seconds: 300
+
+# Experiment tracking
+experiment:
+  enabled: true
+  backend: "mlflow"
+  tracking_uri: "${MLFLOW_TRACKING_URI}"
+  experiment_name: "signal-imputation"
+
+# Security configuration
+security:
+  encryption_at_rest: true
+  encryption_in_transit: true
+  audit_logging: true
+  
+  # Role-based access control
+  rbac:
+    enabled: true
+    default_role: "ML_DEVELOPER_ROLE"
+
+# Performance tuning
+performance:
+  # Query optimization
+  query:
+    result_cache: true
+    warehouse_resume_auto: true
+    statement_timeout_seconds: 3600
+  
+  # Feature serving
+  feature_serving:
+    cache_enabled: true
+    cache_ttl_seconds: 300
+    batch_size: 1000
+
+# Development configuration
+development:
+  debug: false
+  profile: false
+  seed: 42
+
+# Environment-specific overrides
+environments:
+  development:
+    snowflake:
+      warehouse: "DEV_WH"
+      database: "DEV_DATABASE"
+    monitoring:
+      enabled: false
+    deployment:
+      auto_rollback: false
+  
+  staging:
+    snowflake:
+      warehouse: "STAGING_WH"
+      database: "STAGING_DATABASE"
+    monitoring:
+      enabled: true
+    deployment:
+      auto_rollback: true
+  
+  production:
+    snowflake:
+      warehouse: "PROD_WH"
+      database: "PROD_DATABASE"
+    monitoring:
+      enabled: true
+      alerts:
+        enabled: true
+    deployment:
+      auto_rollback: true
+      health_checks:
+        failure_threshold: 1

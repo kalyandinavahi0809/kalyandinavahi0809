@@ -1,0 +1,386 @@
+name: Quality Checks
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  schedule:
+    # Run daily at 6 AM UTC
+    - cron: '0 6 * * *'
+
+env:
+  PYTHON_VERSION: '3.9'
+
+jobs:
+  code-quality:
+    name: Code Quality Checks
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install flake8 black pylint bandit safety
+      
+      - name: Run Black (code formatting)
+        run: |
+          black --check modeling/ feature_store/ monitoring/ data/ tests/
+      
+      - name: Run Flake8 (linting)
+        run: |
+          flake8 modeling/ feature_store/ monitoring/ data/ tests/ \
+            --count \
+            --max-complexity=10 \
+            --max-line-length=100 \
+            --statistics
+      
+      - name: Run Pylint
+        run: |
+          pylint modeling/ feature_store/ monitoring/ data/ \
+            --fail-under=8.0 \
+            --reports=y
+      
+      - name: Security scan with Bandit
+        run: |
+          bandit -r modeling/ feature_store/ monitoring/ data/ \
+            -f json -o bandit-report.json
+      
+      - name: Check dependencies for vulnerabilities
+        run: |
+          safety check --json
+      
+      - name: Upload security reports
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: security-reports
+          path: |
+            bandit-report.json
+
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-cov pytest-xdist
+      
+      - name: Run unit tests
+        run: |
+          pytest tests/ \
+            -m "not integration and not slow" \
+            -v \
+            --cov=. \
+            --cov-report=xml \
+            --cov-report=html \
+            --cov-report=term \
+            --junitxml=junit.xml \
+            -n auto
+      
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v3
+        with:
+          files: ./coverage.xml
+          flags: unittests
+          name: codecov-umbrella
+      
+      - name: Upload test results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: test-results
+          path: |
+            junit.xml
+            htmlcov/
+
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' || github.event_name == 'schedule'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-xdist
+      
+      - name: Run integration tests
+        run: |
+          pytest tests/ \
+            -m integration \
+            -v \
+            --junitxml=integration-results.xml
+      
+      - name: Upload integration test results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: integration-test-results
+          path: integration-results.xml
+
+  data-quality:
+    name: Data Quality Checks
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      
+      - name: Run data quality checks
+        run: |
+          python monitoring/quality_checks.py \
+            --config config.yaml \
+            --output-json quality_report.json
+      
+      - name: Check quality thresholds
+        run: |
+          python scripts/check_quality_thresholds.py \
+            --report quality_report.json \
+            --fail-on-critical
+      
+      - name: Upload quality report
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: data-quality-report
+          path: quality_report.json
+
+  drift-detection:
+    name: Drift Detection
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      
+      - name: Run drift detection
+        run: |
+          python monitoring/drift_detection.py \
+            --config config.yaml \
+            --output-json drift_report.json
+      
+      - name: Check drift thresholds
+        id: check_drift
+        run: |
+          python scripts/check_drift_thresholds.py \
+            --report drift_report.json \
+            --psi-threshold 0.1
+      
+      - name: Create drift alert issue
+        if: steps.check_drift.outputs.drift_detected == 'true'
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const fs = require('fs');
+            const driftReport = JSON.parse(fs.readFileSync('drift_report.json', 'utf8'));
+            
+            github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: '⚠️ Data Drift Detected',
+              body: `Data drift has been detected in the following features:\n\n${JSON.stringify(driftReport, null, 2)}\n\nPlease investigate and consider model retraining.`,
+              labels: ['ml-pipeline', 'drift-alert', 'priority-medium']
+            })
+      
+      - name: Upload drift report
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: drift-report
+          path: drift_report.json
+
+  model-performance:
+    name: Monitor Model Performance
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      
+      - name: Check model performance
+        id: performance
+        run: |
+          python scripts/check_model_performance.py \
+            --window-hours 24 \
+            --output-json performance_report.json
+          
+          # Parse and output metrics
+          RMSE=$(jq -r '.rmse' performance_report.json)
+          MAE=$(jq -r '.mae' performance_report.json)
+          DEGRADED=$(jq -r '.performance_degraded' performance_report.json)
+          
+          echo "rmse=$RMSE" >> $GITHUB_OUTPUT
+          echo "mae=$MAE" >> $GITHUB_OUTPUT
+          echo "degraded=$DEGRADED" >> $GITHUB_OUTPUT
+      
+      - name: Create performance alert
+        if: steps.performance.outputs.degraded == 'true'
+        uses: actions/github-script@v6
+        with:
+          script: |
+            github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: '📉 Model Performance Degradation Detected',
+              body: `Model performance has degraded:\n\n- RMSE: ${{ steps.performance.outputs.rmse }}\n- MAE: ${{ steps.performance.outputs.mae }}\n\nConsider model retraining or investigation.`,
+              labels: ['ml-pipeline', 'performance-alert', 'priority-high']
+            })
+      
+      - name: Upload performance report
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: performance-report
+          path: performance_report.json
+
+  type-checking:
+    name: Type Checking
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install mypy
+      
+      - name: Run MyPy
+        run: |
+          mypy modeling/ feature_store/ monitoring/ data/ \
+            --ignore-missing-imports \
+            --strict-optional \
+            --warn-redundant-casts \
+            --warn-unused-ignores
+
+  documentation:
+    name: Documentation Check
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Check for missing docstrings
+        run: |
+          pip install interrogate
+          interrogate -v modeling/ feature_store/ monitoring/ data/ \
+            --fail-under 80 \
+            --ignore-init-method \
+            --ignore-init-module
+
+  notify:
+    name: Notify Results
+    runs-on: ubuntu-latest
+    needs: [code-quality, unit-tests, type-checking]
+    if: always() && github.event_name == 'schedule'
+    
+    steps:
+      - name: Send Slack notification
+        uses: slackapi/slack-github-action@v1
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          payload: |
+            {
+              "text": "Daily Quality Checks Complete",
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "✅ Daily Quality Checks"
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Code Quality:* ${{ needs.code-quality.result }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Unit Tests:* ${{ needs.unit-tests.result }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Type Checking:* ${{ needs.type-checking.result }}"
+                    }
+                  ]
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "View details: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                  }
+                }
+              ]
+            }
